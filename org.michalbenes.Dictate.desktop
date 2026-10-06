@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Dictate
+Comment=Speech to text
+Exec=@EXEC@
+Icon=audio-input-microphone
+Terminal=false
+Categories=Utility;Audio;
+Keywords=speech;dictation;transcribe;voice;
