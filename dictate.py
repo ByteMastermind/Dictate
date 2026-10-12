@@ -1,25 +1,71 @@
 #!/usr/bin/env python3
+import ctypes
+import os
 import re
 import shutil
 import subprocess
 import sys
 import threading
+from collections import deque
 from pathlib import Path
 
 import gi
 
+from settings import MODELS, Settings
+
+if Settings.load().keep_on_top:
+    os.environ.setdefault("GDK_BACKEND", "x11,wayland")
+
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk
+gi.require_version("GdkX11", "4.0")
+gi.require_version("Gsk", "4.0")
+gi.require_version("Graphene", "1.0")
+from gi.repository import Adw, Gdk, GdkX11, Gio, GLib, Graphene, Gsk, Gtk
 
-from recorder import RATE, Recorder, list_microphones
-from settings import MODELS, Settings
+from recorder import CHUNK, RATE, Recorder, list_microphones
 from textfix import cleanup, polish
 from transcriber import Transcriber, download, model_ready
 
 APP_ID = "org.michalbenes.Dictate"
 MEDIA_KEYS = "org.gnome.settings-daemon.plugins.media-keys"
 KEYBINDINGS = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/"
+LEVEL_INTERVAL_US = CHUNK * 1_000_000 // (2 * RATE)
+CSS = "@keyframes pulse { 50% { opacity: 0.25; } } .pulse { animation: pulse 1.6s ease-in-out infinite; }"
+X11_CLIENT_MESSAGE = 33
+X11_SUBSTRUCTURE_MASK = 3 << 19
+NET_WM_STATE_ADD = 1
+
+
+class XClientMessage(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("message_type", ctypes.c_ulong),
+        ("format", ctypes.c_int),
+        ("data", ctypes.c_long * 5),
+        ("pad", ctypes.c_long * 12),
+    ]
+
+
+def keep_above(surface: Gdk.Surface) -> None:
+    if not isinstance(surface, GdkX11.X11Surface):
+        return
+    x11 = ctypes.CDLL("libX11.so.6")
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    x11.XInternAtom.restype = x11.XDefaultRootWindow.restype = ctypes.c_ulong
+    x11.XDefaultRootWindow.argtypes = x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    x11.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_long, ctypes.c_void_p]
+    display = x11.XOpenDisplay(None)
+    above = x11.XInternAtom(display, b"_NET_WM_STATE_ABOVE", False)
+    event = XClientMessage(type=X11_CLIENT_MESSAGE, window=surface.get_xid(), message_type=x11.XInternAtom(display, b"_NET_WM_STATE", False), format=32)
+    event.data[:2] = [NET_WM_STATE_ADD, above]
+    x11.XSendEvent(display, x11.XDefaultRootWindow(display), False, X11_SUBSTRUCTURE_MASK, ctypes.byref(event))
+    x11.XCloseDisplay(display)
 
 
 def launcher_command() -> str:
@@ -60,6 +106,57 @@ def copy_to_clipboard(text: str) -> None:
     raise RuntimeError("install wl-clipboard or xclip")
 
 
+class Waveform(Gtk.Widget):
+    BAR = 4
+    STEP = 7
+    HISTORY = 400
+    DELAY_US = 200_000
+
+    def __init__(self):
+        super().__init__(height_request=72, hexpand=True)
+        self._tick_id = 0
+        self.clear()
+
+    def clear(self) -> None:
+        self.levels = deque([0.0] * self.HISTORY, maxlen=self.HISTORY)
+        self.count = 0
+        self.start = 0
+
+    def push(self, level: float) -> None:
+        if not self.count:
+            self.start = GLib.get_monotonic_time()
+        self.levels.append(level)
+        self.count += 1
+
+    def do_map(self) -> None:
+        Gtk.Widget.do_map(self)
+        self._tick_id = self.add_tick_callback(lambda *_: self.queue_draw() or True)
+
+    def do_unmap(self) -> None:
+        self.remove_tick_callback(self._tick_id)
+        Gtk.Widget.do_unmap(self)
+
+    def do_snapshot(self, snapshot: Gtk.Snapshot) -> None:
+        width, height = self.get_width(), self.get_height()
+        accent = Adw.StyleManager.get_default().get_accent_color_rgba()
+        elapsed = self.get_frame_clock().get_frame_time() - self.start if self.count else 0
+        position = (elapsed - self.DELAY_US) / LEVEL_INTERVAL_US
+        for i, level in enumerate(reversed(self.levels)):
+            age = position - (self.count - 1 - i)
+            if age < 0:
+                continue
+            x = width - self.BAR - age * self.STEP
+            if x < -self.BAR:
+                break
+            bar = self.BAR + level * (height - self.BAR)
+            rect = Gsk.RoundedRect()
+            rect.init_from_rect(Graphene.Rect().init(x, (height - bar) / 2, self.BAR, bar), self.BAR / 2)
+            color = Gdk.RGBA(red=accent.red, green=accent.green, blue=accent.blue, alpha=max(0, min(1, age, x / (width * 0.4))))
+            snapshot.push_rounded_clip(rect)
+            snapshot.append_color(color, rect.bounds)
+            snapshot.pop()
+
+
 class Window(Adw.ApplicationWindow):
     def __init__(self, app: "App"):
         super().__init__(application=app, default_width=560, default_height=360)
@@ -87,18 +184,30 @@ class Window(Adw.ApplicationWindow):
         self.toasts = Adw.ToastOverlay(child=box)
         self.set_content(self.toasts)
 
+        css = Gtk.CssProvider()
+        css.load_from_string(CSS)
+        Gtk.StyleContext.add_provider_for_display(self.get_display(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        finish_keys = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        finish_keys.connect("key-pressed", self._on_finish_key)
+        self.add_controller(finish_keys)
         keys = Gtk.EventControllerKey()
         keys.connect("key-pressed", self._on_key)
         self.add_controller(keys)
         self.connect("close-request", lambda *_: app.on_close())
+        if app.settings.keep_on_top:
+            self.connect("map", lambda *_: keep_above(self.get_surface()))
 
     def _recording_page(self) -> Gtk.Widget:
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, valign=Gtk.Align.CENTER, margin_start=32, margin_end=32)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16, valign=Gtk.Align.CENTER, margin_start=32, margin_end=32)
+        timer_row = Gtk.Box(spacing=10, halign=Gtk.Align.CENTER)
         self.timer = Gtk.Label(label="0:00", css_classes=["title-1", "numeric"])
-        self.level = Gtk.LevelBar(min_value=0, max_value=1)
+        timer_row.append(Gtk.Image(icon_name="media-record-symbolic", pixel_size=16, css_classes=["error", "pulse"]))
+        timer_row.append(self.timer)
+        self.waveform = Waveform()
         hint = Gtk.Label(label=f"{shortcut_label(self.app.settings.shortcut)} or Enter to finish, Esc to cancel", css_classes=["dim-label"])
         self.status = Gtk.Label(css_classes=["dim-label", "caption"])
-        for widget in (Gtk.Image(icon_name="media-record-symbolic", pixel_size=32, css_classes=["error"]), self.timer, self.level, hint, self.status):
+        for widget in (timer_row, self.waveform, hint, self.status):
             box.append(widget)
         return box
 
@@ -115,7 +224,7 @@ class Window(Adw.ApplicationWindow):
 
     def show_recording(self) -> None:
         self.timer.set_label("0:00")
-        self.level.set_value(0)
+        self.waveform.clear()
         self.title.set_subtitle("Recording")
         self.record_button.set_visible(False)
         self.copy_button.set_visible(False)
@@ -142,12 +251,15 @@ class Window(Adw.ApplicationWindow):
     def toast(self, text: str) -> None:
         self.toasts.add_toast(Adw.Toast(title=text, timeout=3))
 
+    def _on_finish_key(self, _controller, keyval: int, _keycode, _state) -> bool:
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and self.app.state == "recording" and not self.get_visible_dialog():
+            self.app.toggle()
+            return True
+        return False
+
     def _on_key(self, _controller, keyval: int, _keycode, _state) -> bool:
         if keyval == Gdk.KEY_Escape:
             self.app.cancel()
-            return True
-        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and self.app.state == "recording":
-            self.app.toggle()
             return True
         return False
 
@@ -171,7 +283,10 @@ class App(Adw.Application):
             self.finish()
         elif self.state == "idle":
             self.start()
-        self.window.present()
+        if self.state == "working" and self.settings.autohide:
+            self.window.set_visible(False)
+        else:
+            self.window.present()
 
     def start(self) -> None:
         self.recorder = Recorder(self.settings.microphone, lambda level: GLib.idle_add(self._set_level, level))
@@ -186,7 +301,7 @@ class App(Adw.Application):
 
     def _set_level(self, level: float) -> bool:
         if self.state == "recording":
-            self.window.level.set_value(level)
+            self.window.waveform.push(level)
         return False
 
     def _tick(self) -> bool:
@@ -231,12 +346,15 @@ class App(Adw.Application):
         GLib.idle_add(self._done, text, warning)
 
     def _done(self, text: str, warning: str) -> bool:
+        s = self.settings
         self.state = "idle"
         self.window.show_result(text)
         if warning or not text:
             self.window.toast(warning or "No speech recognized")
-        if text and self.settings.auto_copy and self.copy_result(notify=self.settings.notify) and self.settings.close_after_copy:
+        if text and (s.auto_copy or s.autohide) and self.copy_result(notify=s.notify) and (s.close_after_copy or (s.autohide and not warning)):
             self.window.close()
+        else:
+            self.window.set_visible(True)
         return False
 
     def copy_result(self, notify: bool = False) -> bool:
@@ -280,6 +398,11 @@ class App(Adw.Application):
         clipboard.add(self._switch("Notify", "Show a notification when the text is copied automatically", "notify"))
         clipboard.add(self._switch("Close window after copying", "", "close_after_copy"))
         page.add(clipboard)
+
+        window = Adw.PreferencesGroup(title="Window")
+        window.add(self._switch("Auto-hide", "Close as soon as recording stops, copy the text when it is ready", "autohide"))
+        window.add(self._switch("Keep on top", "Stay above other windows (runs through XWayland, applies on next start)", "keep_on_top"))
+        page.add(window)
 
         transcription = Adw.PreferencesGroup(title="Transcription")
         model_row = Adw.ComboRow(title="Model", model=Gtk.StringList.new(list(MODELS.values())))

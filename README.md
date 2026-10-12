@@ -14,7 +14,9 @@ Needs `python3-gi`, `gir1.2-gtk-4.0`, `gir1.2-adw-1`, `python3-venv` and `wl-cli
 
 - **Super+R** (or Enter in the window) starts and stops recording, **Esc** cancels.
 - The text appears in an editable window and is copied to the clipboard automatically. The copy button copies the edited text, the microphone button records again.
-- The gear opens settings: automatic copy, notification, close after copying, model (English v2 or multilingual v3), microphone, filler removal, repeated-word collapsing, polish command, shortcut.
+- The window stays above other windows. GNOME on Wayland gives apps no way to do that, so Dictate runs through XWayland while **Keep on top** is enabled.
+- With **Auto-hide** the window closes as soon as recording stops, the text is copied once it is transcribed. The window comes back only when something fails.
+- The gear opens settings: automatic copy, notification, close after copying, auto-hide, keep on top, model (English v2 or multilingual v3), microphone, filler removal, repeated-word collapsing, polish command, shortcut.
 
 ## Polish command
 

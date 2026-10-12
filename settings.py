@@ -16,6 +16,8 @@ class Settings:
     auto_copy: bool = True
     notify: bool = True
     close_after_copy: bool = False
+    autohide: bool = False
+    keep_on_top: bool = True
     model: str = "parakeet-tdt-0.6b-v2"
     microphone: str = ""
     remove_fillers: bool = True
